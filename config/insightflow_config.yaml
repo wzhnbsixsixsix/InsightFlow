@@ -1,0 +1,76 @@
+# ── InsightFlow 配置文件 ──
+
+# 全局配置
+app:
+  name: "InsightFlow"
+  version: "0.1.0"
+  log_level: "INFO"
+
+# 模型配置
+model:
+  temperature: 0.3
+  stream: true
+  enable_thinking: false
+
+# ── 销售线索模块配置 ──
+sales_leads:
+  # 搜索配置
+  search:
+    max_search_tasks: 8
+    max_leads_per_search: 15
+    enable_deduplication: true
+
+  # BANT 评估配置
+  qualification:
+    hot_threshold: 70
+    warm_threshold: 40
+    max_qualification_batch: 30
+
+  # 联系人搜索配置
+  contact_enrichment:
+    max_contacts_per_lead: 3
+    only_hot_warm: true
+
+  # 输出配置
+  output:
+    report_format: "markdown"
+    csv_encoding: "utf-8-sig"
+    output_dir: "outputs/sales_leads"
+
+  # 搜索深度预设
+  depth_presets:
+    quick:
+      search_tasks: 3
+      max_leads: 10
+      timeout_minutes: 3
+    standard:
+      search_tasks: 6
+      max_leads: 25
+      timeout_minutes: 8
+    deep:
+      search_tasks: 8
+      max_leads: 50
+      timeout_minutes: 15
+
+  # Agent 模型分配
+  models:
+    sales_orchestrator: "qwen-turbo-1101"
+    product_profiler: "qwen-turbo-1101"
+    market_scanner: "qwen-turbo-1101"
+    lead_qualifier: "qwen-turbo-1101"
+    contact_enrichment: "qwen-turbo-1101"
+    lead_report_writer: "qwen-turbo-1101"
+
+# 搜索引擎配置
+# 可选: duckduckgo (免费，默认) | bocha (便宜，中文好) | tavily (贵但质量高)
+search:
+  provider: "duckduckgo"
+
+# MCP 工具配置
+mcp:
+  tavily:
+    command: "npx"
+    args: ["-y", "tavily-mcp@latest"]
+  qichacha:
+    transport: "streamable_http"
+    url_template: "https://mcp.qcc.com/basic/stream?key={key}"

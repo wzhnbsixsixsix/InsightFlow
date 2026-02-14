@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Environment variables
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Outputs
+outputs/sales_leads/*.md
+outputs/sales_leads/*.csv
+outputs/reports/*.md
+
+# Logs
+*.log
+logs/
+
+# Misc
+*.bak
+*.tmp
+Test_script.md
+Test_script.md

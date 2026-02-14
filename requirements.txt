@@ -1,0 +1,21 @@
+# InsightFlow dependencies
+
+# Agent framework
+agentscope>=1.0.15
+
+# LLM
+dashscope
+
+# UI
+gradio>=4.0
+
+# Data models
+pydantic>=2.0
+
+# Configuration
+python-dotenv
+pyyaml
+
+# Utilities
+httpx
+shortuuid
