@@ -36,7 +36,7 @@
 | 传统获客方式 | InsightFlow 销售线索 |
 |-------------|---------------------|
 | 销售手动搜索，效率低 | 多 Agent 并行搜索，5-10 分钟出结果 |
-| 凭经验判断线索质量 | BANT 框架量化评估，数据驱动 |
+| 凭经验判断线索质量 | Broad 模式快速给出目标大名单 / Full 模式用 BANT 深度评估 |
 | 联系人信息分散，难汇总 | 自动聚合联系方式，输出 CSV 可直接导入 CRM |
 | 触达话术千篇一律 | 针对每条线索定制触达建议 |
 
@@ -45,9 +45,9 @@
 ```
 作为一名销售经理，
 我希望输入我们的产品名称（如 "AgentScope —— 多智能体开发框架"），
-系统能自动找到 20-30 家可能需要这个产品的企业，
-并告诉我每家企业的关键决策人是谁、怎么联系、怎么开场，
-这样我的销售团队可以直接开始外呼/发邮件，而不是花一周时间手动调研。
+系统能自动找到大量可能需要这个产品的企业（Broad 模式广撒网），
+或者深度分析 20-30 家最相关的企业（Full 模式），告诉决策人是谁、怎么联系、怎么开场，
+这样我的销售团队可以直接开始初步接触或精准外呼，而不是花一周时间手动调研。
 ```
 
 ### 1.4 输入/输出
@@ -108,15 +108,16 @@
               │                  │                      │
               └──────────────────┼──────────────────────┘
                                  │
-                  ┌──────────────▼───────────────────┐
-                  │      Lead Report Writer            │
-                  │  (报告生成 / Markdown + CSV)        │
-                  │                                    │
-                  │  - 按优先级排列线索                  │
-                  │  - 每条线索配联系人 + 触达建议       │
-                  │  - 输出 .md 报告 + .csv 数据文件    │
-                  └──────────────┬───────────────────┘
-                                 │
+                   ┌──────────────▼───────────────────┐
+                   │      Lead Report Writer            │
+                   │  (报告生成 / Markdown + CSV)        │
+                   │                                    │
+                   │  - Broad 模式: 输出大规模线索矩阵   │
+                   │  - Full 模式: 按优先级排列线索，每条  │
+                   │    线索配联系人 + 触达建议          │
+                   │  - 输出 .md 报告 + .csv 数据文件    │
+                   └──────────────┬───────────────────┘
+                                  │
       ┌──────────────────────────▼──────────────────────────────────┐
       │                      Tool Layer (MCP)                       │
       │  ┌───────────────┐ ┌──────────────┐ ┌────────────────────┐ │
@@ -188,10 +189,12 @@
 │      └── "multi-agent system enterprise deployment"                 │
 │                                                                     │
 │  输出: RawLead[] (去重合并后)                                       │
+│  * 注意: Broad 模式下，如果第一轮搜索不足，将使用 DDGS 无头查询扩量。   │
 │                                                                     │
 └─────────────────────────────────────────────────────────────────────┘
           │
-          ▼
+          ├─────────────────────────────────────────────┐
+          ▼ (Full 模式继续)                               ▼ (Broad 模式提前结束，生成大规模简报)
 ┌─── Phase 3: 线索评估 ─────────────────────────────────────────────┐
 │                                                                     │
 │  Lead Qualifier Agent                                               │
@@ -284,6 +287,8 @@ User       Orchestrator   Profiler   Scanner(×N)    Qualifier   Enrichment(×N)
   │             │                         │              │              │  生成 .csv │
   │             │                         │              │              │            │
   │◄────────────────────────── 返回报告 + CSV 下载链接 ────────────────────────────── │
+
+  * 注：以上为 Full 模式流程。如果是默认的 Broad 模式（广撒网），将在 Scanner 后自动判定是否需要用 DDGS 补充数据量，然后跳过 Qualifier 和 Enrichment，直接输出包含数百条记录的轻量报告与 CSV。
 ```
 
 ---
@@ -319,6 +324,10 @@ ReportWriter         -           -         -         -           -           -
 Profiler ──► Orchestrator ──► Scanner ──► Qualifier ──► Enrichment ──► ReportWriter
   (产品画像)    (ICP+策略)    (原始线索)    (评估线索)    (富化线索)      (最终报告)
 ```
+
+在系统实现上，有两处安全机制：
+1. **模型降级机制 (`_resolve_model_name`)**：支持用户任意配置模型，但若检测到代码模型（其工具调用结构容易报错），则自动回退到工具兼容性最好的基座模型（如 `qwen-max`）。
+2. **工具幻觉纠错 (`CorrectedToolkit`)**：针对特定模型常犯的错误（例如误认 `_tools` 或 `required` 为工具名），由中间层拦截并返回明确的自然语言指导，让 Agent 的自纠正循环走回正轨。
 
 ### 4.3 模型分配策略
 
@@ -1254,119 +1263,63 @@ class SalesLeadReport(BaseModel):
 ### 7.1 主编排函数
 
 ```python
-"""
+\"""
 InsightFlow 销售线索模块 - 编排逻辑
-文件路径: src/orchestrator_sales.py
-"""
+文件路径: src/orchestrator_sales.py (此为伪代码结构简练版)
+\"""
 
 import asyncio
 import json
 import time
-from datetime import datetime
-from typing import Callable, Optional
 
 from agentscope.agent import ReActAgent
-from agentscope.model import DashScopeChatModel
-from agentscope.formatter import DashScopeChatFormatter
-from agentscope.memory import InMemoryMemory
-from agentscope.tool import Toolkit
-from agentscope.pipeline import MsgHub
-from agentscope.message import Msg
-
-from src.models.sales_schemas import (
-    ProductProfile, SalesSearchPlan, RawLead, ScanResult,
-    QualifiedLead, QualificationResult, EnrichedLead,
-    SalesLeadReport, LeadPriority,
-)
-from src.prompts.sales_prompts import (
-    SYS_PROMPT_SALES_ORCHESTRATOR,
-    SYS_PROMPT_PRODUCT_PROFILER,
-    SYS_PROMPT_MARKET_SCANNER,
-    SYS_PROMPT_LEAD_QUALIFIER,
-    SYS_PROMPT_CONTACT_ENRICHMENT,
-    SYS_PROMPT_LEAD_REPORT_WRITER,
-)
-from src.tools.web_search import setup_bing_search_toolkit
-from src.tools.file_tools import setup_file_toolkit
 from src.config import Config
-
+from src.tools.web_search import setup_search_toolkit, setup_file_toolkit
+from src.agents import (
+    _resolve_model_name,
+    _create_model,
+    _clone_toolkit,
+)
+from src.prompts.sales_prompts import *
 
 # ================================================================
 #  Agent 初始化
 # ================================================================
 
-def create_model(model_name: str) -> DashScopeChatModel:
-    """创建 DashScope 模型实例"""
-    config = Config()
-    return DashScopeChatModel(
-        model_name=model_name,
-        api_key=config.dashscope_api_key,
-        stream=True,
-        temperature=config.get("model.temperature", 0.3),
-    )
-
-
 async def create_agents(
-    web_toolkit: Toolkit,
-    file_toolkit: Toolkit,
+    web_toolkit,
+    file_toolkit,
 ) -> dict[str, ReActAgent]:
-    """创建所有销售线索 Agent"""
+    """创建所有销售线索 Agent，内含模型降级修复"""
+    config = Config()
 
-    model_max = create_model("qwen-max")
-    model_plus = create_model("qwen-plus")
+    # 1. 解析模型名称（自动回退代码模型）
+    m_orch = _resolve_model_name("sales_orchestrator", config.get_model_name("sales_orchestrator"), config)
+    m_prof = _resolve_model_name("product_profiler", config.get_model_name("product_profiler"), config)
+    
+    # 2. 创建真实模型实例
+    model_orchestrator = _create_model(m_orch)
+    model_profiler = _create_model(m_prof)
 
+    # 3. 创建 Agent (使用 _clone_toolkit 避免工具注册冲突，含幻觉纠错)
     agents = {
         "sales_orchestrator": ReActAgent(
             name="Sales_Orchestrator",
             sys_prompt=SYS_PROMPT_SALES_ORCHESTRATOR,
-            model=model_max,
-            memory=InMemoryMemory(),
-            formatter=DashScopeChatFormatter(),
+            model=model_orchestrator,
+            toolkit=_clone_toolkit(web_toolkit),
         ),
         "product_profiler": ReActAgent(
             name="Product_Profiler",
             sys_prompt=SYS_PROMPT_PRODUCT_PROFILER,
-            model=model_plus,
-            memory=InMemoryMemory(),
-            formatter=DashScopeChatFormatter(),
-            toolkit=web_toolkit,
+            model=model_profiler,
+            toolkit=_clone_toolkit(web_toolkit),
         ),
-        "market_scanner": ReActAgent(
-            name="Market_Scanner",
-            sys_prompt=SYS_PROMPT_MARKET_SCANNER,
-            model=model_plus,
-            memory=InMemoryMemory(),
-            formatter=DashScopeChatFormatter(),
-            toolkit=web_toolkit,
-        ),
-        "lead_qualifier": ReActAgent(
-            name="Lead_Qualifier",
-            sys_prompt=SYS_PROMPT_LEAD_QUALIFIER,
-            model=model_max,
-            memory=InMemoryMemory(),
-            formatter=DashScopeChatFormatter(),
-            toolkit=web_toolkit,
-        ),
-        "contact_enrichment": ReActAgent(
-            name="Contact_Enrichment",
-            sys_prompt=SYS_PROMPT_CONTACT_ENRICHMENT,
-            model=model_plus,
-            memory=InMemoryMemory(),
-            formatter=DashScopeChatFormatter(),
-            toolkit=web_toolkit,
-        ),
-        "lead_report_writer": ReActAgent(
-            name="Lead_Report_Writer",
-            sys_prompt=SYS_PROMPT_LEAD_REPORT_WRITER,
-            model=model_max,
-            memory=InMemoryMemory(),
-            formatter=DashScopeChatFormatter(),
-            toolkit=file_toolkit,
-        ),
+        # ... 其他 Agent 略
     }
 
     return agents
-
+```
 
 # ================================================================
 #  辅助函数

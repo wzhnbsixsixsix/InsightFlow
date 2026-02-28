@@ -71,21 +71,21 @@ async def _extract_text_from_url(url: str, max_chars: int = 8000) -> str:
 def _register_duckduckgo(toolkit: Toolkit) -> None:
     """注册 DuckDuckGo 搜索工具函数到 Toolkit"""
 
-    async def web_search(query: str, max_results: int = 8) -> ToolResponse:
+    async def web_search(query: str, max_results: int = 30) -> ToolResponse:
         """搜索互联网获取信息。返回包含标题、URL和摘要的搜索结果列表。
 
         Args:
             query (str):
                 搜索关键词，建议2-6个词。
             max_results (int):
-                返回结果数量，最多10条。
+                返回结果数量，最多50条。
         """
         from ddgs import DDGS
 
         # 防御：LLM 有时传空字符串或非整数
         if not isinstance(max_results, int) or max_results <= 0:
-            max_results = 8
-        max_results = min(max_results, 10)
+            max_results = 30
+        max_results = min(max_results, 50)
         try:
             import random
             import time
@@ -156,7 +156,7 @@ def _register_duckduckgo(toolkit: Toolkit) -> None:
 def _register_bocha(toolkit: Toolkit, api_key: str) -> None:
     """注册博查搜索工具函数到 Toolkit"""
 
-    async def web_search(query: str, max_results: int = 8) -> ToolResponse:
+    async def web_search(query: str, max_results: int = 30) -> ToolResponse:
         """搜索互联网获取信息。返回包含标题、URL和摘要的搜索结果列表。
 
         Args:
@@ -169,7 +169,7 @@ def _register_bocha(toolkit: Toolkit, api_key: str) -> None:
 
         # 防御：LLM 有时传空字符串或非整数
         if not isinstance(max_results, int) or max_results <= 0:
-            max_results = 8
+            max_results = 30
         max_results = min(max_results, 50)
         try:
             async with httpx.AsyncClient(timeout=15.0) as client:

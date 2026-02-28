@@ -14,10 +14,18 @@ model:
 
 # ── 销售线索模块配置 ──
 sales_leads:
+  # 流水线模式
+  # broad: 广撒网模式（默认，追求公司数量，输出公司信息+reason）
+  # full: 完整模式（BANT + 联系人富化 + 长报告）
+  pipeline:
+    mode: "broad"
+    broad:
+      min_leads: 100
+
   # 搜索配置
   search:
-    max_search_tasks: 8
-    max_leads_per_search: 15
+    max_search_tasks: 60
+    max_leads_per_search: 60
     enable_deduplication: true
 
   # BANT 评估配置
@@ -40,26 +48,38 @@ sales_leads:
   # 搜索深度预设
   depth_presets:
     quick:
-      search_tasks: 3
-      max_leads: 10
-      timeout_minutes: 3
+      search_tasks: 12
+      max_leads: 120
+      timeout_minutes: 5
     standard:
-      search_tasks: 6
-      max_leads: 25
-      timeout_minutes: 8
+      search_tasks: 30
+      max_leads: 350
+      timeout_minutes: 12
     deep:
-      search_tasks: 8
-      max_leads: 50
-      timeout_minutes: 15
+      search_tasks: 60
+      max_leads: 800
+      timeout_minutes: 20
 
   # Agent 模型分配
+  # 上线前测试阶段使用较小的模型版本，节省成本
+  # models:
+  #   sales_orchestrator: "qwen-turbo-1101"
+  #   product_profiler: "qwen-turbo-1101"
+  #   market_scanner: "qwen-turbo-1101"
+  #   lead_qualifier: "qwen-turbo-1101"
+  #   contact_enrichment: "qwen-turbo-1101"
+  #   lead_report_writer: "qwen-turbo-1101"
+  # 上线前统一替换为最新的模型版本
   models:
-    sales_orchestrator: "qwen-turbo-1101"
-    product_profiler: "qwen-turbo-1101"
-    market_scanner: "qwen-turbo-1101"
-    lead_qualifier: "qwen-turbo-1101"
-    contact_enrichment: "qwen-turbo-1101"
-    lead_report_writer: "qwen-turbo-1101"
+    sales_orchestrator: "qwen3-max-preview"
+    product_profiler: "qwen3-max-preview"
+    market_scanner: "qwen3-max-preview"
+    lead_qualifier: "qwen3-max-preview"
+    contact_enrichment: "qwen3-max-preview"
+    lead_report_writer: "qwen3-max-preview"
+
+
+
 
 # 搜索引擎配置
 # 可选: duckduckgo (免费，默认) | bocha (便宜，中文好) | tavily (贵但质量高)

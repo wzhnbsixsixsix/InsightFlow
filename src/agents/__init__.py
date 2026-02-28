@@ -34,6 +34,38 @@ from src.prompts.sales_prompts import (
 _DASHSCOPE_OPENAI_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
 
+def _looks_like_code_model(model_name: str) -> bool:
+    """判断模型名是否为代码模型（函数调用兼容性较差）。"""
+    name = (model_name or "").strip().lower()
+    if not name:
+        return False
+    return ("coder" in name) or ("-code" in name) or ("code-" in name)
+
+
+def _resolve_model_name(agent_id: str, configured_name: str, config: Config) -> str:
+    """为 Agent 解析最终模型名，必要时自动回退到工具调用稳定模型。"""
+    fallback_name = config.get(
+        "sales_leads.models_fallback.default_tool_model",
+        "qwen3-max-2025-09-23",
+    )
+    disable_auto_fallback = bool(
+        config.get("sales_leads.models_fallback.disable_auto_fallback", False)
+    )
+
+    if disable_auto_fallback:
+        return configured_name
+
+    if _looks_like_code_model(configured_name):
+        print(
+            f"[Agents] 警告: {agent_id} 配置了代码模型 {configured_name}，"
+            f"可能导致 function.arguments 非 JSON 报错。"
+            f"已自动回退为 {fallback_name}。"
+        )
+        return fallback_name
+
+    return configured_name
+
+
 def _create_model(model_name: str) -> OpenAIChatModel:
     """通过 OpenAI 兼容接口创建 DashScope 模型实例。
 
@@ -162,13 +194,46 @@ def create_agents(
     """
     config = Config()
 
-    # 按 YAML 配置分配模型
-    model_orchestrator = _create_model(config.get_model_name("sales_orchestrator"))
-    model_profiler = _create_model(config.get_model_name("product_profiler"))
-    model_scanner = _create_model(config.get_model_name("market_scanner"))
-    model_qualifier = _create_model(config.get_model_name("lead_qualifier"))
-    model_enrichment = _create_model(config.get_model_name("contact_enrichment"))
-    model_writer = _create_model(config.get_model_name("lead_report_writer"))
+    # 按 YAML 配置分配模型（含代码模型自动回退）
+    model_names = {
+        "sales_orchestrator": _resolve_model_name(
+            "sales_orchestrator",
+            config.get_model_name("sales_orchestrator"),
+            config,
+        ),
+        "product_profiler": _resolve_model_name(
+            "product_profiler",
+            config.get_model_name("product_profiler"),
+            config,
+        ),
+        "market_scanner": _resolve_model_name(
+            "market_scanner",
+            config.get_model_name("market_scanner"),
+            config,
+        ),
+        "lead_qualifier": _resolve_model_name(
+            "lead_qualifier",
+            config.get_model_name("lead_qualifier"),
+            config,
+        ),
+        "contact_enrichment": _resolve_model_name(
+            "contact_enrichment",
+            config.get_model_name("contact_enrichment"),
+            config,
+        ),
+        "lead_report_writer": _resolve_model_name(
+            "lead_report_writer",
+            config.get_model_name("lead_report_writer"),
+            config,
+        ),
+    }
+
+    model_orchestrator = _create_model(model_names["sales_orchestrator"])
+    model_profiler = _create_model(model_names["product_profiler"])
+    model_scanner = _create_model(model_names["market_scanner"])
+    model_qualifier = _create_model(model_names["lead_qualifier"])
+    model_enrichment = _create_model(model_names["contact_enrichment"])
+    model_writer = _create_model(model_names["lead_report_writer"])
 
     agents = {
         # Sales Orchestrator: 分析 ICP + 制定搜索策略

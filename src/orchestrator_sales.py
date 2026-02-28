@@ -2,10 +2,13 @@
 InsightFlow 销售线索模块 - 编排逻辑
 文件路径: src/orchestrator_sales.py
 
-5 阶段流水线:
+默认流水线:
   1. Product Profiler  → 产品分析
   2. Sales Orchestrator → ICP + 搜索策略
   3. Market Scanner    → 并行搜索潜在客户
+
+broad 模式（默认）在第 3 步后直接输出大名单；
+full 模式继续执行:
   4. Lead Qualifier    → BANT 评估
   5. Contact Enrichment→ 联系人信息补充 (仅 Hot/Warm)
   6. Lead Report Writer→ 生成 Markdown + CSV
@@ -18,6 +21,7 @@ import os
 import time
 from datetime import datetime
 from typing import Callable, Optional
+from urllib.parse import urlparse
 
 from agentscope.message import Msg
 
@@ -225,6 +229,35 @@ def _extract_structured_or_parse(msg: Msg) -> dict:
     return parse_json_from_msg(msg)
 
 
+def _normalize_sales_plan_data(raw: dict) -> dict:
+    """标准化 Sales Orchestrator 输出，修复嵌套字段被字符串化的问题。"""
+    normalized = dict(raw) if isinstance(raw, dict) else {}
+
+    # icp: 允许是 dict 或 JSON 字符串
+    icp_val = normalized.get("icp")
+    if isinstance(icp_val, str):
+        parsed_icp = _try_parse_json(icp_val)
+        normalized["icp"] = parsed_icp if isinstance(parsed_icp, dict) else {}
+
+    # search_tasks: 允许是 list 或 JSON 字符串
+    tasks_val = normalized.get("search_tasks")
+    if isinstance(tasks_val, str):
+        parsed_tasks = None
+        try:
+            parsed_tasks = json.loads(tasks_val)
+        except (json.JSONDecodeError, ValueError):
+            parsed_tasks = None
+        if isinstance(parsed_tasks, list):
+            normalized["search_tasks"] = parsed_tasks
+        elif isinstance(parsed_tasks, dict):
+            nested = parsed_tasks.get("search_tasks")
+            normalized["search_tasks"] = nested if isinstance(nested, list) else []
+        else:
+            normalized["search_tasks"] = []
+
+    return normalized
+
+
 def merge_and_deduplicate(scan_results: list[Msg]) -> list[dict]:
     """合并多次搜索结果并按公司名去重"""
     seen: set[str] = set()
@@ -247,6 +280,272 @@ def filter_hot_warm(qualified_leads: list[dict]) -> list[dict]:
     return [lead for lead in qualified_leads if lead.get("priority") in ("hot", "warm")]
 
 
+def _normalize_size_value(raw_size: str) -> str:
+    """将规模描述归一化到 small/medium/large/unknown。"""
+    text = (raw_size or "").strip().lower()
+    if not text:
+        return "unknown"
+
+    if text in ("small", "startup", "sme"):
+        return "small"
+    if text in ("medium", "mid-market", "mid_market", "mid market"):
+        return "medium"
+    if text in ("large", "enterprise"):
+        return "large"
+    if text in ("unknown", "n/a", "na"):
+        return "unknown"
+    return text
+
+
+def _normalize_target_sizes(target_sizes: list[str]) -> list[str]:
+    """将 ICP 中的公司规模目标归一化。"""
+    normalized: list[str] = []
+    for item in target_sizes:
+        mapped = _normalize_size_value(item)
+        if mapped != "unknown" and mapped not in normalized:
+            normalized.append(mapped)
+    return normalized
+
+
+def _annotate_size_match(
+    qualified_leads: list[dict],
+    target_sizes: list[str],
+) -> list[dict]:
+    """为线索补充规模匹配信息，便于后续筛选和 CSV 导出。"""
+    normalized_targets = _normalize_target_sizes(target_sizes)
+    for lead in qualified_leads:
+        est_size = _normalize_size_value(lead.get("estimated_size", "unknown"))
+        lead["estimated_size"] = est_size
+        lead["target_company_size"] = normalized_targets
+        lead["size_match"] = "unknown"
+        lead["size_judgement"] = "无法判断规模匹配（企业规模信息不足）"
+
+        if not normalized_targets:
+            lead["size_judgement"] = "ICP 未指定目标规模，默认全规模可跟进"
+            continue
+        if est_size == "unknown":
+            continue
+        if est_size in normalized_targets:
+            lead["size_match"] = "match"
+            lead["size_judgement"] = f"规模匹配 ICP 目标：{', '.join(normalized_targets)}"
+        else:
+            lead["size_match"] = "mismatch"
+            lead["size_judgement"] = (
+                f"规模不匹配 ICP 目标（目标: {', '.join(normalized_targets)}；实际: {est_size}）"
+            )
+
+    return qualified_leads
+
+
+def _generate_default_search_tasks(
+    product_profile: ProductProfile,
+    desired_count: int = 30,
+) -> list[SearchTask]:
+    """当策略编排器失败时，自动生成广覆盖搜索任务。"""
+    pname = product_profile.product_name.strip() or "目标产品"
+    seed_terms: list[str] = [pname]
+    seed_terms.extend(product_profile.use_cases[:8])
+    seed_terms.extend(product_profile.target_users[:8])
+    seed_terms.extend(product_profile.core_features[:6])
+
+    # 去重并限制长度，避免 query 过长
+    normalized_terms: list[str] = []
+    seen_terms: set[str] = set()
+    for term in seed_terms:
+        t = str(term).strip()
+        if not t:
+            continue
+        key = t.lower()
+        if key in seen_terms:
+            continue
+        seen_terms.add(key)
+        normalized_terms.append(t[:28])
+        if len(normalized_terms) >= 12:
+            break
+    if not normalized_terms:
+        normalized_terms = [pname]
+
+    patterns: list[tuple[str, str, str, str]] = [
+        (
+            "procurement_bidding",
+            "{term} 采购 招标 中标 公告",
+            "{term} procurement tender bidding",
+            "有明确采购动作的潜在企业客户",
+        ),
+        (
+            "hiring_signal",
+            "{term} 招聘 工程师 研发 采购 经理",
+            "{term} hiring engineer R&D procurement manager",
+            "正在布局相关团队与技术能力的企业",
+        ),
+        (
+            "funding_news",
+            "{term} 融资 扩产 产线 建设 项目",
+            "{term} funding expansion production line project",
+            "有预算与扩张动作的企业",
+        ),
+        (
+            "industry_forum",
+            "{term} 技术论坛 问答 痛点 方案",
+            "{term} technical forum discussion pain point solution",
+            "存在明确技术痛点与选型需求的企业",
+        ),
+        (
+            "competitor_customer",
+            "{term} 竞品 客户 案例 合作",
+            "{term} competitor customer case partnership",
+            "已采购同类方案、具备替换升级机会的企业",
+        ),
+    ]
+
+    tasks: list[SearchTask] = []
+    task_idx = 1
+    for term in normalized_terms:
+        for strategy, q_zh_tpl, q_en_tpl, expected in patterns:
+            tasks.append(
+                SearchTask(
+                    task_id=f"default_{task_idx}",
+                    strategy=strategy,
+                    query_zh=q_zh_tpl.format(term=term),
+                    query_en=q_en_tpl.format(term=term),
+                    expected_result=expected,
+                )
+            )
+            task_idx += 1
+            if len(tasks) >= desired_count:
+                return tasks
+    return tasks
+
+
+def _task_query_key(task: SearchTask) -> str:
+    """用于搜索任务去重的 key。"""
+    return f"{task.query_zh.strip().lower()}|{task.query_en.strip().lower()}"
+
+
+def _extract_domain(url: str) -> str:
+    """提取 URL 域名。"""
+    try:
+        host = (urlparse(url).netloc or "").lower()
+    except Exception:
+        host = ""
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+
+def _guess_company_name(title: str, url: str) -> str:
+    """从标题或域名中猜测公司名（广撒网补量阶段使用）。"""
+    text = (title or "").strip()
+    for sep in ("｜", "|", "—", "-", "_"):
+        if sep in text:
+            text = text.split(sep)[0].strip()
+    # 常见公告词会污染公司名，尽量去掉
+    for noise in ("招标", "采购", "公告", "中标", "结果", "项目", "公开", "平台"):
+        text = text.replace(noise, "").strip()
+    if len(text) >= 2:
+        return text
+
+    domain = _extract_domain(url)
+    if not domain:
+        return ""
+    # 退化：取一级域名前缀
+    return domain.split(".")[0]
+
+
+async def _expand_leads_for_broad_mode(
+    tasks_to_run: list[SearchTask],
+    existing_leads: list[dict],
+    target_count: int,
+) -> list[dict]:
+    """当广撒网结果过少时，使用 DDGS 直接扩量抓取。"""
+    if len(existing_leads) >= target_count:
+        return existing_leads
+
+    try:
+        from ddgs import DDGS
+    except Exception as e:
+        print(f"[Broad] 扩量跳过：ddgs 不可用: {e}")
+        return existing_leads
+
+    seen_company: set[str] = {
+        str(item.get("company_name", "")).strip().lower()
+        for item in existing_leads
+        if str(item.get("company_name", "")).strip()
+    }
+    seen_domain: set[str] = {
+        _extract_domain(str(item.get("website", "")))
+        for item in existing_leads
+        if _extract_domain(str(item.get("website", "")))
+    }
+
+    queries: list[str] = []
+    seen_query: set[str] = set()
+    for task in tasks_to_run:
+        for q in (task.query_zh, task.query_en):
+            qq = (q or "").strip()
+            if not qq:
+                continue
+            k = qq.lower()
+            if k in seen_query:
+                continue
+            seen_query.add(k)
+            queries.append(qq)
+
+    max_queries = min(len(queries), 80)
+    for query in queries[:max_queries]:
+        if len(existing_leads) >= target_count:
+            break
+
+        def _sync_search() -> list[dict]:
+            with DDGS() as ddgs:
+                raw = list(ddgs.text(query, max_results=50, region="cn-zh"))
+                if not raw:
+                    raw = list(ddgs.text(query, max_results=50))
+                return raw
+
+        try:
+            raw_results = await asyncio.to_thread(_sync_search)
+        except Exception:
+            continue
+
+        for row in raw_results:
+            if len(existing_leads) >= target_count:
+                break
+            url = str(row.get("href", "")).strip()
+            if not url:
+                continue
+            domain = _extract_domain(url)
+            if domain and domain in seen_domain:
+                continue
+
+            company_name = _guess_company_name(str(row.get("title", "")), url)
+            if not company_name:
+                continue
+            company_key = company_name.strip().lower()
+            if company_key in seen_company:
+                continue
+
+            seen_company.add(company_key)
+            if domain:
+                seen_domain.add(domain)
+
+            existing_leads.append(
+                {
+                    "company_name": company_name,
+                    "website": f"https://{domain}" if domain else "",
+                    "industry": "unknown",
+                    "estimated_size": "unknown",
+                    "employee_count_range": "",
+                    "size_evidence": "来自搜索结果标题/摘要，待二次核验",
+                    "match_signals": [str(row.get("body", "")).strip()],
+                    "source_url": url,
+                    "notes": "broad_mode_ddgs_expansion",
+                }
+            )
+
+    return existing_leads
+
+
 def build_enriched_leads(
     qualified_leads: list[dict],
     enrichment_map: dict[str, dict],
@@ -266,14 +565,42 @@ def build_enriched_leads(
 
         # 联系人信息 (如果有)
         enrich = enrichment_map.get(company.strip().lower(), {})
-        contacts = [ContactPerson(**c) for c in enrich.get("contacts", [])]
-        company_contact = CompanyContact(**enrich.get("company_contact", {}))
+        contacts_raw = enrich.get("contacts", [])
+        if isinstance(contacts_raw, str):
+            try:
+                parsed_contacts = json.loads(contacts_raw)
+                contacts_raw = parsed_contacts if isinstance(parsed_contacts, list) else []
+            except (json.JSONDecodeError, ValueError):
+                contacts_raw = []
+        contacts = [
+            ContactPerson(**c)
+            for c in contacts_raw
+            if isinstance(c, dict)
+        ]
+
+        company_contact_raw = enrich.get("company_contact", {})
+        if isinstance(company_contact_raw, str):
+            try:
+                parsed_company_contact = json.loads(company_contact_raw)
+                company_contact_raw = (
+                    parsed_company_contact
+                    if isinstance(parsed_company_contact, dict)
+                    else {}
+                )
+            except (json.JSONDecodeError, ValueError):
+                company_contact_raw = {}
+        company_contact = CompanyContact(**company_contact_raw)
 
         lead = EnrichedLead(
             company_name=company,
             website=ql.get("website", ""),
             industry=ql.get("industry", ""),
             estimated_size=ql.get("estimated_size", "unknown"),
+            employee_count_range=ql.get("employee_count_range", ""),
+            size_evidence=ql.get("size_evidence", ""),
+            target_company_size=ql.get("target_company_size", []),
+            size_match=ql.get("size_match", "unknown"),
+            size_judgement=ql.get("size_judgement", ""),
             qualification_score=ql.get("qualification_score", 0),
             priority=ql.get("priority", "cold"),
             bant_assessment=bant,
@@ -295,6 +622,11 @@ def generate_csv(leads: list[EnrichedLead], filepath: str) -> str:
         "官网",
         "行业",
         "规模",
+        "员工规模区间",
+        "目标公司规模(ICP)",
+        "规模匹配",
+        "规模判断",
+        "规模依据",
         "匹配度",
         "BANT总分",
         "Budget",
@@ -303,8 +635,14 @@ def generate_csv(leads: list[EnrichedLead], filepath: str) -> str:
         "Timing",
         "联系人姓名",
         "联系人职位",
+        "联系人来源",
+        "联系人可信度",
         "邮箱",
         "电话",
+        "公司通用邮箱",
+        "公司电话",
+        "联系页面",
+        "地址",
         "建议触达方式",
         "触达话术",
     ]
@@ -319,6 +657,11 @@ def generate_csv(leads: list[EnrichedLead], filepath: str) -> str:
                 lead.website,
                 lead.industry,
                 lead.estimated_size,
+                lead.employee_count_range,
+                ", ".join(lead.target_company_size),
+                lead.size_match,
+                lead.size_judgement,
+                lead.size_evidence,
                 lead.qualification_score,
                 lead.bant_assessment.total_score,
                 lead.bant_assessment.budget.score,
@@ -328,13 +671,21 @@ def generate_csv(leads: list[EnrichedLead], filepath: str) -> str:
             ]
             if lead.contacts:
                 for contact in lead.contacts:
+                    email = contact.email or lead.company_contact.general_email
+                    phone = contact.phone or lead.company_contact.general_phone
                     writer.writerow(
                         row_base
                         + [
                             contact.name,
                             contact.title,
-                            contact.email,
-                            contact.phone,
+                            contact.source,
+                            contact.confidence,
+                            email,
+                            phone,
+                            lead.company_contact.general_email,
+                            lead.company_contact.general_phone,
+                            lead.company_contact.contact_page,
+                            lead.company_contact.address,
                             lead.recommended_approach,
                             "; ".join(lead.talking_points),
                         ]
@@ -347,11 +698,131 @@ def generate_csv(leads: list[EnrichedLead], filepath: str) -> str:
                         "",
                         "",
                         "",
+                        lead.company_contact.general_email,
+                        lead.company_contact.general_phone,
+                        lead.company_contact.general_email,
+                        lead.company_contact.general_phone,
+                        lead.company_contact.contact_page,
+                        lead.company_contact.address,
                         lead.recommended_approach,
                         "; ".join(lead.talking_points),
                     ]
                 )
     return filepath
+
+
+def _extract_reason_from_lead(lead: dict) -> str:
+    """从原始线索中提取简短 reason。"""
+    signals = lead.get("match_signals", [])
+    if isinstance(signals, list) and signals:
+        first = str(signals[0]).strip()
+        if first:
+            return first
+    notes = str(lead.get("notes", "")).strip()
+    if notes:
+        return notes
+    return "公开信息显示该企业可能有相关产品应用或采购需求。"
+
+
+def build_broad_leads(raw_leads: list[dict]) -> list[EnrichedLead]:
+    """广撒网模式：将原始线索转换为轻量线索结构（公司信息 + reason）。"""
+    leads: list[EnrichedLead] = []
+    for item in raw_leads:
+        reason = _extract_reason_from_lead(item)
+        leads.append(
+            EnrichedLead(
+                company_name=item.get("company_name", ""),
+                website=item.get("website", ""),
+                industry=item.get("industry", ""),
+                estimated_size=item.get("estimated_size", "unknown"),
+                employee_count_range=item.get("employee_count_range", ""),
+                size_evidence=item.get("size_evidence", ""),
+                target_company_size=item.get("target_company_size", []),
+                size_match=item.get("size_match", "unknown"),
+                size_judgement=item.get("size_judgement", ""),
+                qualification_score=0,
+                priority="warm",
+                recommended_approach="优先建立名单并按 reason 快速分配销售跟进",
+                talking_points=[reason],
+            )
+        )
+    return leads
+
+
+def generate_broad_csv(raw_leads: list[dict], filepath: str) -> str:
+    """广撒网模式 CSV：公司信息 + reason + 来源。"""
+    headers = [
+        "公司名",
+        "官网",
+        "行业",
+        "规模",
+        "员工规模区间",
+        "目标公司规模(ICP)",
+        "规模匹配",
+        "规模判断",
+        "规模依据",
+        "reason",
+        "来源URL",
+        "备注",
+    ]
+    os.makedirs(os.path.dirname(filepath) or ".", exist_ok=True)
+    with open(filepath, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f)
+        writer.writerow(headers)
+        for lead in raw_leads:
+            writer.writerow(
+                [
+                    lead.get("company_name", ""),
+                    lead.get("website", ""),
+                    lead.get("industry", ""),
+                    lead.get("estimated_size", "unknown"),
+                    lead.get("employee_count_range", ""),
+                    ", ".join(lead.get("target_company_size", [])),
+                    lead.get("size_match", "unknown"),
+                    lead.get("size_judgement", ""),
+                    lead.get("size_evidence", ""),
+                    _extract_reason_from_lead(lead),
+                    lead.get("source_url", ""),
+                    lead.get("notes", ""),
+                ]
+            )
+    return filepath
+
+
+def generate_broad_markdown(
+    product_profile: ProductProfile,
+    search_plan: SalesSearchPlan,
+    raw_leads: list[dict],
+    tasks_to_run: list[SearchTask],
+) -> str:
+    """生成广撒网模式的简版报告。"""
+    total = len(raw_leads)
+    preview_count = min(total, 100)
+    lines = [
+        f"# {product_profile.product_name} 潜在客户清单（广撒网模式）",
+        "",
+        "## 结果概要",
+        f"- 潜在公司总数: **{total}**",
+        f"- 目标行业: {', '.join(search_plan.icp.target_industries) if search_plan.icp.target_industries else '未限定'}",
+        f"- 目标规模: {', '.join(search_plan.icp.company_size) if search_plan.icp.company_size else '未限定'}",
+        f"- 执行搜索任务数: {len(tasks_to_run)}",
+        "",
+        "说明：完整名单请使用同目录 CSV 文件；下方仅展示前 100 条预览。",
+        "",
+        "## 线索预览",
+        "| 公司 | 行业 | 规模 | reason | 来源 |",
+        "|---|---|---|---|---|",
+    ]
+
+    for lead in raw_leads[:preview_count]:
+        company = lead.get("company_name", "")
+        industry = lead.get("industry", "")
+        size = lead.get("estimated_size", "unknown")
+        reason = _extract_reason_from_lead(lead).replace("|", "/")
+        source = lead.get("source_url", "")
+        lines.append(f"| {company} | {industry} | {size} | {reason} | {source} |")
+
+    return "\n".join(lines)
 
 
 # ================================================================
@@ -377,6 +848,7 @@ async def run_sales_lead_search(
     """
     config = Config()
     start_time = time.time()
+    pipeline_mode = str(config.get("sales_leads.pipeline.mode", "broad")).lower()
 
     def log(message: str):
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -390,14 +862,20 @@ async def run_sales_lead_search(
     try:
         # ── Step 0: 初始化 ──────────────────────────────────────
         log("初始化 Agent 和工具...")
+        log(f"[Pipeline] 当前模式: {pipeline_mode}")
         search_toolkit, mcp_clients = await setup_search_toolkit(enable_qcc=True)
         file_toolkit = await setup_file_toolkit()
         agents = create_agents(search_toolkit, file_toolkit)
 
         # ── Step 1: 产品分析 ────────────────────────────────────
         log(f"[Product Profiler] 正在分析产品: {product_input}")
+        profiler_input = (
+            "这是我正在销售的产品，请以卖方视角分析，"
+            "目标是找到会采购/使用该产品的企业客户，而不是同类产品供应商。\n\n"
+            f"产品信息：{product_input}"
+        )
         product_msg = await agents["product_profiler"](
-            Msg("user", product_input, "user"),
+            Msg("user", profiler_input, "user"),
             structured_model=ProductProfile,
         )
         product_data = _extract_structured_or_parse(product_msg)
@@ -423,7 +901,7 @@ async def run_sales_lead_search(
             product_msg,
             structured_model=SalesSearchPlan,
         )
-        plan_data = _extract_structured_or_parse(icp_msg)
+        plan_data = _normalize_sales_plan_data(_extract_structured_or_parse(icp_msg))
 
         # 诊断日志: Sales Orchestrator 返回的原始数据
         log(f"[Sales Orchestrator] 原始数据 keys={list(plan_data.keys())}")
@@ -442,7 +920,7 @@ async def run_sales_lead_search(
                 parsed = _try_parse_json(content_text)
                 if parsed and (parsed.get("search_tasks") or parsed.get("icp")):
                     log("[Sales Orchestrator] 从 content 文本中二次提取到 JSON")
-                    plan_data = parsed
+                    plan_data = _normalize_sales_plan_data(parsed)
 
         try:
             search_plan = SalesSearchPlan(**plan_data)
@@ -480,39 +958,46 @@ async def run_sales_lead_search(
 
         log("[Sales Orchestrator] ICP 完成")
         log(f"  目标行业: {search_plan.icp.target_industries}")
+        log(f"  目标规模: {search_plan.icp.company_size}")
         log(f"  搜索任务数: {len(search_plan.search_tasks)}")
+
+        # 按搜索深度限制任务数
+        depth_preset = config.get_depth_preset(depth)
+        max_tasks = int(depth_preset.get("search_tasks", 30))
 
         # 如果没有搜索任务，生成默认任务
         if not search_plan.search_tasks:
             log("[Sales Orchestrator] 无搜索任务，生成默认搜索策略...")
-            pname = product_profile.product_name
-            search_plan.search_tasks = [
-                SearchTask(
-                    task_id="default_1",
-                    strategy="direct_need",
-                    query_zh=f"{pname} 采购 客户",
-                    query_en=f"{pname} buyer customer",
-                    expected_result="使用该产品的企业客户",
-                ),
-                SearchTask(
-                    task_id="default_2",
-                    strategy="competitor_customer",
-                    query_zh=f"{pname} 主要厂商 客户案例",
-                    query_en=f"{pname} major vendor customer case",
-                    expected_result="主要厂商的客户",
-                ),
-                SearchTask(
-                    task_id="default_3",
-                    strategy="industry_event",
-                    query_zh=f"{pname} 行业应用 企业",
-                    query_en=f"{pname} industry application company",
-                    expected_result="应用该产品的企业",
-                ),
-            ]
+            fallback_count = int(config.get("sales_leads.search.max_search_tasks", 60))
+            desired_count = max(max_tasks, min(fallback_count, 60))
+            search_plan.search_tasks = _generate_default_search_tasks(
+                product_profile=product_profile,
+                desired_count=desired_count,
+            )
+            log(
+                f"[Sales Orchestrator] 默认策略生成完成: "
+                f"{len(search_plan.search_tasks)} 个任务"
+            )
 
-        # 按搜索深度限制任务数
-        depth_preset = config.get_depth_preset(depth)
-        max_tasks = depth_preset.get("search_tasks", 6)
+        # 如果任务数不足，自动补齐（广撒网优先）
+        if len(search_plan.search_tasks) < max_tasks:
+            missing = max_tasks - len(search_plan.search_tasks)
+            log(f"[Sales Orchestrator] 搜索任务不足，自动补齐 {missing} 个任务...")
+            extra_tasks = _generate_default_search_tasks(
+                product_profile=product_profile,
+                desired_count=max_tasks * 2,
+            )
+            existing_keys = {_task_query_key(t) for t in search_plan.search_tasks}
+            for task in extra_tasks:
+                key = _task_query_key(task)
+                if key in existing_keys:
+                    continue
+                search_plan.search_tasks.append(task)
+                existing_keys.add(key)
+                if len(search_plan.search_tasks) >= max_tasks:
+                    break
+            log(f"[Sales Orchestrator] 补齐后任务数: {len(search_plan.search_tasks)}")
+
         tasks_to_run = search_plan.search_tasks[:max_tasks]
 
         # ── Step 3: 逐个搜索潜在客户 ───────────────────────────
@@ -533,6 +1018,7 @@ async def run_sales_lead_search(
                         "query_zh": task.query_zh,
                         "query_en": task.query_en,
                         "expected_result": task.expected_result,
+                        "target_company_size": search_plan.icp.company_size,
                     },
                     ensure_ascii=False,
                 ),
@@ -561,6 +1047,71 @@ async def run_sales_lead_search(
                 product_profile=product_profile,
                 icp=search_plan.icp,
                 execution_time_seconds=time.time() - start_time,
+            )
+
+        # 统一补充规模匹配信息
+        all_leads = _annotate_size_match(all_leads, search_plan.icp.company_size)
+
+        # 广撒网模式：跳过 BANT/联系人富化/长报告，直接输出大名单
+        if pipeline_mode == "broad":
+            max_leads = int(depth_preset.get("max_leads", 350))
+            min_leads = int(config.get("sales_leads.pipeline.broad.min_leads", 100))
+
+            # 第一轮结果不足时，启用程序化扩量抓取
+            if len(all_leads) < min_leads:
+                log(
+                    f"[Broad] 第一轮仅 {len(all_leads)} 条，"
+                    f"低于目标最小值 {min_leads}，启动扩量抓取..."
+                )
+                all_leads = await _expand_leads_for_broad_mode(
+                    tasks_to_run=tasks_to_run,
+                    existing_leads=all_leads,
+                    target_count=min(min_leads, max_leads),
+                )
+                all_leads = _annotate_size_match(all_leads, search_plan.icp.company_size)
+                log(f"[Broad] 扩量后线索数: {len(all_leads)}")
+
+            if max_leads > 0:
+                all_leads = all_leads[:max_leads]
+            log(f"[Pipeline] 广撒网模式：保留 {len(all_leads)} 条潜在公司线索")
+
+            output_dir = config.output_dir
+            os.makedirs(output_dir, exist_ok=True)
+            timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+            product_slug = product_profile.product_name.replace(" ", "_")[:30]
+            md_path = os.path.join(output_dir, f"{product_slug}_{timestamp_str}.md")
+            csv_path = os.path.join(output_dir, f"{product_slug}_{timestamp_str}.csv")
+
+            report_content = generate_broad_markdown(
+                product_profile=product_profile,
+                search_plan=search_plan,
+                raw_leads=all_leads,
+                tasks_to_run=tasks_to_run,
+            )
+            with open(md_path, "w", encoding="utf-8") as f:
+                f.write(report_content)
+            log(f"报告已保存: {md_path}")
+
+            generate_broad_csv(all_leads, csv_path)
+            log(f"CSV 已保存: {csv_path}")
+
+            enriched_leads = build_broad_leads(all_leads)
+            elapsed = time.time() - start_time
+            log(f"全部完成！耗时 {elapsed:.1f} 秒")
+            return SalesLeadReport(
+                product_name=product_profile.product_name,
+                product_profile=product_profile,
+                icp=search_plan.icp,
+                leads=enriched_leads,
+                total_leads=len(enriched_leads),
+                hot_leads=0,
+                warm_leads=len(enriched_leads),
+                cold_leads=0,
+                report_filepath=md_path,
+                csv_filepath=csv_path,
+                search_strategies_used=[t.strategy for t in tasks_to_run],
+                total_search_queries=len(tasks_to_run),
+                execution_time_seconds=elapsed,
             )
 
         # ── Step 4: BANT 评估 ──────────────────────────────────
@@ -604,6 +1155,10 @@ async def run_sales_lead_search(
                     break
 
         qualified_leads = qualified_data.get("qualified_leads", [])
+        qualified_leads = _annotate_size_match(
+            qualified_leads,
+            search_plan.icp.company_size,
+        )
         summary = qualified_data.get("summary", {})
 
         # 如果 summary 为空但 qualified_leads 不为空，手动构建 summary
@@ -658,6 +1213,8 @@ async def run_sales_lead_search(
                     )
                     data = _extract_structured_or_parse(result)
                     company_key = data.get("company_name", "").strip().lower()
+                    if not company_key:
+                        company_key = lead.get("company_name", "").strip().lower()
                     if company_key:
                         enrichment_map[company_key] = data
                 except BaseException as e:

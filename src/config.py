@@ -105,5 +105,5 @@ class Config:
         """获取搜索深度预设"""
         return self.get(
             f"sales_leads.depth_presets.{depth}",
-            {"search_tasks": 6, "max_leads": 25, "timeout_minutes": 8},
+            {"search_tasks": 30, "max_leads": 350, "timeout_minutes": 12},
         )

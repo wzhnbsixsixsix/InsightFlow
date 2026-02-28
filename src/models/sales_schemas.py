@@ -3,11 +3,12 @@ InsightFlow 销售线索模块 - Pydantic 数据模型
 文件路径: src/models/sales_schemas.py
 """
 
+import json
 from datetime import datetime
 from enum import Enum
-from typing import Optional
+from typing import Any, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 # ================================================================
@@ -103,6 +104,52 @@ class ICP(BaseModel):
     tech_stack_signals: list[str] = []
     budget_indicators: list[str] = []
 
+    @classmethod
+    def _coerce_str_list(cls, value: Any) -> list[str]:
+        """将字符串/JSON 字符串稳健转换为 list[str]。"""
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return [str(item).strip() for item in value if str(item).strip()]
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return []
+            # 优先尝试把字符串当 JSON 解析
+            if text.startswith("["):
+                try:
+                    parsed = json.loads(text)
+                    if isinstance(parsed, list):
+                        return [
+                            str(item).strip()
+                            for item in parsed
+                            if str(item).strip()
+                        ]
+                except (json.JSONDecodeError, ValueError):
+                    pass
+            # 退化为逗号/顿号/换行拆分
+            parts = (
+                text.replace("，", ",")
+                .replace("、", ",")
+                .replace("\n", ",")
+                .split(",")
+            )
+            return [p.strip() for p in parts if p.strip()]
+        return []
+
+    @field_validator(
+        "target_industries",
+        "company_size",
+        "geography",
+        "pain_points",
+        "tech_stack_signals",
+        "budget_indicators",
+        mode="before",
+    )
+    @classmethod
+    def _normalize_list_fields(cls, value: Any) -> list[str]:
+        return cls._coerce_str_list(value)
+
 
 class SearchTask(BaseModel):
     """搜索任务"""
@@ -126,6 +173,54 @@ class SalesSearchPlan(BaseModel):
     competitor_products: list[str] = []
     disqualification_criteria: list[str] = []
 
+    @field_validator("icp", mode="before")
+    @classmethod
+    def _normalize_icp(cls, value: Any) -> Any:
+        """兼容 icp 为 JSON 字符串的情况。"""
+        if isinstance(value, (ICP, dict)):
+            return value
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return {}
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, dict):
+                    return parsed
+            except (json.JSONDecodeError, ValueError):
+                return {}
+        return {}
+
+    @field_validator("search_tasks", mode="before")
+    @classmethod
+    def _normalize_search_tasks(cls, value: Any) -> list[Any]:
+        """兼容 search_tasks 为 JSON 字符串的情况。"""
+        if isinstance(value, list):
+            return value
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return []
+            try:
+                parsed = json.loads(text)
+            except (json.JSONDecodeError, ValueError):
+                return []
+            if isinstance(parsed, list):
+                return parsed
+            if isinstance(parsed, dict):
+                nested = parsed.get("search_tasks")
+                return nested if isinstance(nested, list) else []
+            return []
+        if isinstance(value, dict):
+            nested = value.get("search_tasks")
+            return nested if isinstance(nested, list) else []
+        return []
+
+    @field_validator("competitor_products", "disqualification_criteria", mode="before")
+    @classmethod
+    def _normalize_text_lists(cls, value: Any) -> list[str]:
+        return ICP._coerce_str_list(value)
+
 
 # ================================================================
 #  原始线索 (Market Scanner 输出)
@@ -139,6 +234,8 @@ class RawLead(BaseModel):
     website: str = ""
     industry: str = ""
     estimated_size: str = "unknown"
+    employee_count_range: str = ""
+    size_evidence: str = ""
     match_signals: list[str] = []
     source_url: str = ""
     notes: str = ""
@@ -200,6 +297,11 @@ class QualifiedLead(BaseModel):
     website: str = ""
     industry: str = ""
     estimated_size: str = "unknown"
+    employee_count_range: str = ""
+    size_evidence: str = ""
+    target_company_size: list[str] = []
+    size_match: str = "unknown"
+    size_judgement: str = ""
     qualification_score: int = Field(default=0, ge=0, le=100)
     priority: str = "cold"
     bant_assessment: BANTAssessment = BANTAssessment()
@@ -247,6 +349,7 @@ class CompanyContact(BaseModel):
     """公司级别的联系信息"""
 
     general_email: str = ""
+    general_phone: str = ""
     contact_page: str = ""
     address: str = ""
 
@@ -259,6 +362,11 @@ class EnrichedLead(BaseModel):
     website: str = ""
     industry: str = ""
     estimated_size: str = "unknown"
+    employee_count_range: str = ""
+    size_evidence: str = ""
+    target_company_size: list[str] = []
+    size_match: str = "unknown"
+    size_judgement: str = ""
 
     # 评估信息
     qualification_score: int = Field(default=0, ge=0, le=100)
